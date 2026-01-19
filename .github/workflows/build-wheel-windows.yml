@@ -7,51 +7,74 @@ on:
 jobs:
   build-wheel-windows:
     runs-on: windows-latest
+    timeout-minutes: 120
 
     env:
       CMAKE_BUILD_TYPE: Release
       INSTALL_PREFIX: C:/install/libsmu
       VCPKG_TRIPLET: x64-windows
+      # vcpkg のバイナリキャッシュを有効化（2回目以降が高速）
+      VCPKG_FEATURE_FLAGS: binarycaching
+      VCPKG_BINARY_SOURCES: clear;default,readwrite
+      # CMake/ビルドの並列度
+      CMAKE_BUILD_PARALLEL_LEVEL: 4
 
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
+
+      # vcpkg のバイナリアーカイブをキャッシュ（高速化）
+      - name: Restore vcpkg binary cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            C:\Users\runneradmin\AppData\Local\vcpkg\archives
+          key: vcpkg-bin-${{ runner.os }}-${{ env.VCPKG_TRIPLET }}-libusb-boost
+          restore-keys: |
+            vcpkg-bin-${{ runner.os }}-${{ env.VCPKG_TRIPLET }}-
 
       - name: Set up Python 3.14
         uses: actions/setup-python@v5
         with:
           python-version: '3.14'
 
-      - name: Install build tools (vcpkg)
+      - name: Install vcpkg
         shell: pwsh
         run: |
           git clone https://github.com/microsoft/vcpkg.git $env:USERPROFILE\vcpkg
           & $env:USERPROFILE\vcpkg\bootstrap-vcpkg.bat
-          # vcpkg toolchain のパスを Actions 環境へ
+          # vcpkg toolchain のパスを後続ステップへ
           "VCPKG_CHAIN_FILE=$env:USERPROFILE\vcpkg\scripts\buildsystems\vcpkg.cmake" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Install dependencies with vcpkg (libusb + boost-math + pkgconf)
+      - name: Install dependencies with vcpkg (libusb + boost + pkgconf)
         shell: pwsh
         run: |
-          # vcpkg で必要最小限の依存を導入
+          # 依存導入（boost はメタパッケージで一括）
           & $env:USERPROFILE\vcpkg\vcpkg.exe install libusb --triplet $env:VCPKG_TRIPLET
-          & $env:USERPROFILE\vcpkg\vcpkg.exe install boost-math --triplet $env:VCPKG_TRIPLET
-          # pkg-config 互換 (pkgconf) を導入
+          & $env:USERPROFILE\vcpkg\vcpkg.exe install boost  --triplet $env:VCPKG_TRIPLET
           & $env:USERPROFILE\vcpkg\vcpkg.exe install pkgconf --triplet $env:VCPKG_TRIPLET
 
-          # CMake が pkg-config を使えるよう、実行ファイルと .pc のパスを環境に通す
-          $pkgconf = Join-Path $env:USERPROFILE "vcpkg\installed\$env:VCPKG_TRIPLET\tools\pkgconf\pkgconf.exe"
-          $pcpath  = Join-Path $env:USERPROFILE "vcpkg\installed\$env:VCPKG_TRIPLET\lib\pkgconfig"
+          # pkgconf 実行ファイルと .pc のパスを環境へ
+          $tripletRoot = Join-Path $env:USERPROFILE "vcpkg\installed\$env:VCPKG_TRIPLET"
+          $pkgconf = Join-Path $tripletRoot "tools\pkgconf\pkgconf.exe"
+          $pcLib   = Join-Path $tripletRoot "lib\pkgconfig"
+          $pcShare = Join-Path $tripletRoot "share\pkgconfig"
+
           if (!(Test-Path $pkgconf)) { Write-Error "pkgconf not found at $pkgconf" }
-          if (!(Test-Path $pcpath))  { Write-Error "pkg-config .pc path not found at $pcpath" }
+          "PKG_CONFIG=$pkgconf" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-          # Actions の後続ステップへ環境変数を引き継ぐ
-          "PKG_CONFIG=$pkgconf"     | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "PKG_CONFIG_PATH=$pcpath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $paths = @()
+          if (Test-Path $pcLib)   { $paths += $pcLib }
+          if (Test-Path $pcShare) { $paths += $pcShare }
+          if ($paths.Count -eq 0) { Write-Error "No pkgconfig directory found under $tripletRoot" }
 
-          # デバッグ：見えるか確認（失敗しても続行）
+          "PKG_CONFIG_PATH=$($paths -join ';')" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          # 確認（失敗しても続行）
           & $pkgconf --version
-          Get-ChildItem $pcpath | Select-Object -First 10 | ForEach-Object { $_.Name }
+          Write-Host "PKG_CONFIG_PATH=$($paths -join ';')"
+          foreach ($p in $paths) { Get-ChildItem $p | Select-Object -First 5 | ForEach-Object { $_.Name } }
+          & $pkgconf --cflags --libs libusb-1.0 || Write-Host "libusb .pc not resolved yet (will also pass include/lib explicitly at configure)"
 
       - name: Prep Python packages
         shell: pwsh
@@ -62,44 +85,43 @@ jobs:
       - name: Configure & build libsmu with MSVC (Visual Studio generator)
         shell: pwsh
         run: |
+          # vcpkg の libusb のパスを明示（pkg-config の保険）
+          $tripletRoot = Join-Path $env:USERPROFILE "vcpkg\installed\$env:VCPKG_TRIPLET"
+          $libusbInc = Join-Path $tripletRoot "include\libusb-1.0"
+          $libusbLib = Join-Path $tripletRoot "lib\libusb-1.0.lib"
+          Write-Host "Using LIBUSB_INCLUDE_DIRS=$libusbInc"
+          Write-Host "Using LIBUSB_LIBRARIES=$libusbLib"
+
+          # クリーン & 生成
+          if (Test-Path build) { Remove-Item -Recurse -Force build }
           mkdir build
           cd build
+
           cmake .. `
             -G "Visual Studio 17 2022" `
             -A x64 `
             -DCMAKE_BUILD_TYPE=%CMAKE_BUILD_TYPE% `
             -DCMAKE_INSTALL_PREFIX="${env:INSTALL_PREFIX}" `
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_CHAIN_FILE" `
-            -DPython3_EXECUTABLE="$((Get-Command python).Source)"
-          cmake --build . --config Release
+            -DLIBUSB_INCLUDE_DIRS="$libusbInc" `
+            -DLIBUSB_LIBRARIES="$libusbLib" `
+            -DBUILD_TESTS=OFF `
+            -DBUILD_EXAMPLES=OFF `
+            -DBUILD_CLI=OFF
+
+          cmake --build . --config Release -- /m
           cmake --install . --config Release
 
-      - name: Put libsmu.dll next to pysmu package
+      - name: Put libsmu DLL next to pysmu package
         shell: pwsh
         run: |
-          $dll = "${env:INSTALL_PREFIX}\bin\libsmu.dll"
-          if (!(Test-Path $dll)) {
-            Write-Error "libsmu.dll not found at $dll"
+          $bindir = "${env:INSTALL_PREFIX}\bin"
+          $dll = Get-ChildItem -Path $bindir -Filter "*smu*.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $dll) {
+            Write-Host "DLL not in install prefix, trying build output..."
+            $dll = Get-ChildItem -Recurse -Path ".\build" -Filter "*smu*.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
           }
-          Copy-Item $dll bindings/python/pysmu/libsmu.dll -Force
+          if (-not $dll) { Write-Error "smu DLL not found under $bindir or build/ tree" }
+          Copy-Item $dll.FullName bindings/python/pysmu/libsmu.dll -Force
+          Write-Host "Copied $($dll.FullName) -> bindings/python/pysmu/libsmu.dll"
 
-      - name: Clean python binding folder
-        shell: pwsh
-        working-directory: bindings/python
-        run: |
-          if (Test-Path build) { Remove-Item -Recurse -Force build }
-          if (Test-Path dist) { Remove-Item -Recurse -Force dist }
-          if (Test-Path pysmu.egg-info) { Remove-Item -Recurse -Force pysmu.egg-info }
-
-      - name: Build pysmu wheel (Windows)
-        shell: pwsh
-        working-directory: bindings/python
-        run: |
-          python -m build --wheel
-
-      - name: Upload wheel (Windows)
-        uses: actions/upload-artifact@v4
-        with:
-          name: pysmu-wheel-windows
-          path: bindings/python/dist/*.whl
-          retention-days: 7
