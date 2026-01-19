@@ -1,4 +1,3 @@
-
 name: Build pysmu wheel (Windows)
 
 on:
@@ -13,25 +12,10 @@ jobs:
       CMAKE_BUILD_TYPE: Release
       INSTALL_PREFIX: C:/install/libsmu
       VCPKG_TRIPLET: x64-windows
-      # vcpkg のバイナリキャッシュを有効化（2回目以降が高速）
-      VCPKG_FEATURE_FLAGS: binarycaching
-      VCPKG_BINARY_SOURCES: clear;default,readwrite
-      # CMake/ビルドの並列度
-      CMAKE_BUILD_PARALLEL_LEVEL: 4
 
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
-
-      # vcpkg のバイナリアーカイブをキャッシュ（高速化）
-      - name: Restore vcpkg binary cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            C:\Users\runneradmin\AppData\Local\vcpkg\archives
-          key: vcpkg-bin-${{ runner.os }}-${{ env.VCPKG_TRIPLET }}-libusb-boost
-          restore-keys: |
-            vcpkg-bin-${{ runner.os }}-${{ env.VCPKG_TRIPLET }}-
 
       - name: Set up Python 3.14
         uses: actions/setup-python@v5
@@ -43,38 +27,13 @@ jobs:
         run: |
           git clone https://github.com/microsoft/vcpkg.git $env:USERPROFILE\vcpkg
           & $env:USERPROFILE\vcpkg\bootstrap-vcpkg.bat
-          # vcpkg toolchain のパスを後続ステップへ
           "VCPKG_CHAIN_FILE=$env:USERPROFILE\vcpkg\scripts\buildsystems\vcpkg.cmake" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Install dependencies with vcpkg (libusb + boost + pkgconf)
+      - name: Install dependencies with vcpkg (libusb + boost)
         shell: pwsh
         run: |
-          # 依存導入（boost はメタパッケージで一括）
           & $env:USERPROFILE\vcpkg\vcpkg.exe install libusb --triplet $env:VCPKG_TRIPLET
           & $env:USERPROFILE\vcpkg\vcpkg.exe install boost  --triplet $env:VCPKG_TRIPLET
-          & $env:USERPROFILE\vcpkg\vcpkg.exe install pkgconf --triplet $env:VCPKG_TRIPLET
-
-          # pkgconf 実行ファイルと .pc のパスを環境へ
-          $tripletRoot = Join-Path $env:USERPROFILE "vcpkg\installed\$env:VCPKG_TRIPLET"
-          $pkgconf = Join-Path $tripletRoot "tools\pkgconf\pkgconf.exe"
-          $pcLib   = Join-Path $tripletRoot "lib\pkgconfig"
-          $pcShare = Join-Path $tripletRoot "share\pkgconfig"
-
-          if (!(Test-Path $pkgconf)) { Write-Error "pkgconf not found at $pkgconf" }
-          "PKG_CONFIG=$pkgconf" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
-          $paths = @()
-          if (Test-Path $pcLib)   { $paths += $pcLib }
-          if (Test-Path $pcShare) { $paths += $pcShare }
-          if ($paths.Count -eq 0) { Write-Error "No pkgconfig directory found under $tripletRoot" }
-
-          "PKG_CONFIG_PATH=$($paths -join ';')" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
-          # 確認（失敗しても続行）
-          & $pkgconf --version
-          Write-Host "PKG_CONFIG_PATH=$($paths -join ';')"
-          foreach ($p in $paths) { Get-ChildItem $p | Select-Object -First 5 | ForEach-Object { $_.Name } }
-          & $pkgconf --cflags --libs libusb-1.0 || Write-Host "libusb .pc not resolved yet (will also pass include/lib explicitly at configure)"
 
       - name: Prep Python packages
         shell: pwsh
@@ -82,17 +41,16 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install --upgrade build setuptools wheel cffi
 
-      - name: Configure & build libsmu with MSVC (Visual Studio generator)
+      - name: Configure & build libsmu with MSVC
         shell: pwsh
         run: |
-          # vcpkg の libusb のパスを明示（pkg-config の保険）
-          $tripletRoot = Join-Path $env:USERPROFILE "vcpkg\installed\$env:VCPKG_TRIPLET"
-          $libusbInc = Join-Path $tripletRoot "include\libusb-1.0"
-          $libusbLib = Join-Path $tripletRoot "lib\libusb-1.0.lib"
-          Write-Host "Using LIBUSB_INCLUDE_DIRS=$libusbInc"
-          Write-Host "Using LIBUSB_LIBRARIES=$libusbLib"
+          $tripletRoot = "$env:USERPROFILE/vcpkg/installed/$env:VCPKG_TRIPLET"
+          $libusbInc = "$tripletRoot/include/libusb-1.0"
+          $libusbLib = "$tripletRoot/lib/libusb-1.0.lib"
 
-          # クリーン & 生成
+          Write-Host "LIBUSB_INCLUDE_DIRS=$libusbInc"
+          Write-Host "LIBUSB_LIBRARIES=$libusbLib"
+
           if (Test-Path build) { Remove-Item -Recurse -Force build }
           mkdir build
           cd build
@@ -112,7 +70,7 @@ jobs:
           cmake --build . --config Release -- /m
           cmake --install . --config Release
 
-      - name: Put libsmu DLL next to pysmu package
+      - name: Put libsmu.dll next to pysmu package
         shell: pwsh
         run: |
           $bindir = "${env:INSTALL_PREFIX}\bin"
@@ -121,7 +79,26 @@ jobs:
             Write-Host "DLL not in install prefix, trying build output..."
             $dll = Get-ChildItem -Recurse -Path ".\build" -Filter "*smu*.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
           }
-          if (-not $dll) { Write-Error "smu DLL not found under $bindir or build/ tree" }
+          if (-not $dll) { Write-Error "smu DLL not found" }
           Copy-Item $dll.FullName bindings/python/pysmu/libsmu.dll -Force
-          Write-Host "Copied $($dll.FullName) -> bindings/python/pysmu/libsmu.dll"
 
+      - name: Clean Python binding folder
+        shell: pwsh
+        working-directory: bindings/python
+        run: |
+          if (Test-Path build) { Remove-Item -Recurse -Force build }
+          if (Test-Path dist) { Remove-Item -Recurse -Force dist }
+          if (Test-Path pysmu.egg-info) { Remove-Item -Recurse -Force pysmu.egg-info }
+
+      - name: Build pysmu wheel (Windows)
+        shell: pwsh
+        working-directory: bindings/python
+        run: |
+          python -m build --wheel
+
+      - name: Upload wheel (Windows)
+        uses: actions/upload-artifact@v4
+        with:
+          name: pysmu-wheel-windows
+          path: bindings/python/dist/*.whl
+          retention-days: 7
