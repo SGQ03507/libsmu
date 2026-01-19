@@ -1,4 +1,3 @@
-
 name: Build pysmu wheel
 
 on:
@@ -56,6 +55,27 @@ jobs:
           ninja -v
           sudo ninja install
           sudo ldconfig
+
+
+      - name: Prepare python binding folder (clean & permissions)
+        working-directory: bindings/python
+        run: |
+          # 既存のビルド残骸を除去
+          sudo rm -rf build dist pysmu.egg-info || true
+          # 所有者を runner に戻す（root 所有になっている場合に備える）
+          sudo chown -R $USER:$USER .
+          # 書き込み可能に
+          chmod -R u+rwX .
+
+      - name: Build pysmu wheel
+        working-directory: bindings/python
+        run: |
+          # 念のため再度クリーン
+          rm -rf build dist pysmu.egg-info || true
+          # libsmu が見えているか（見えなくても続行）
+          pkg-config --cflags --libs libsmu || true
+          # wheel ビルド
+          python -m build --wheel
 
       - name: Build pysmu wheel
         working-directory: bindings/python
