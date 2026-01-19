@@ -1,1 +1,92 @@
 
+name: Build pysmu wheel (Windows)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-wheel-windows:
+    runs-on: windows-latest
+
+    env:
+      CMAKE_BUILD_TYPE: Release
+      ARCH: x64
+      # vcpkg の triplet
+      VCPKG_DEFAULT_TRIPLET: x64-windows
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      - name: Install build tools (CMake, Ninja, vcpkg)
+        shell: pwsh
+        run: |
+          choco install -y ninja
+          git clone https://github.com/microsoft/vcpkg.git $env:USERPROFILE\vcpkg
+          & $env:USERPROFILE\vcpkg\bootstrap-vcpkg.bat
+
+      - name: Install libusb with vcpkg
+        shell: pwsh
+        run: |
+          & $env:USERPROFILE\vcpkg\vcpkg.exe install libusb --triplet x64-windows
+          # vcpkg の CMake ツールチェーンを環境変数に保持
+          echo "VCPKG_CHAIN_FILE=$env:USERPROFILE\vcpkg\scripts\buildsystems\vcpkg.cmake" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Prep Python packages
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade build setuptools wheel cffi
+
+      - name: Configure & build libsmu (MSVC)
+        shell: pwsh
+        run: |
+          mkdir build
+          cd build
+          cmake .. `
+            -G "Ninja" `
+            -DCMAKE_BUILD_TYPE=%CMAKE_BUILD_TYPE% `
+            -DCMAKE_INSTALL_PREFIX="C:/install/libsmu" `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_CHAIN_FILE" `
+            -DPython3_EXECUTABLE="$((Get-Command python).Source)"
+          ninja
+          ninja install
+
+      - name: Put libsmu.dll next to pysmu package
+        shell: pwsh
+        run: |
+          # libsmu.dll がインストールされた場所を探して pysmu と一緒に配布
+          # 通常 C:/install/libsmu/bin/libsmu.dll
+          $dll = "C:/install/libsmu/bin/libsmu.dll"
+          if (!(Test-Path $dll)) {
+            Write-Error "libsmu.dll not found at $dll"
+          }
+          # Python バインディングの配布物に DLL を同梱する
+          Copy-Item $dll bindings/python/pysmu/libsmu.dll -Force
+
+      - name: Clean python binding folder
+        shell: pwsh
+        working-directory: bindings/python
+        run: |
+          if (Test-Path build) { Remove-Item -Recurse -Force build }
+          if (Test-Path dist) { Remove-Item -Recurse -Force dist }
+          if (Test-Path pysmu.egg-info) { Remove-Item -Recurse -Force pysmu.egg-info }
+
+      - name: Build pysmu wheel (Windows)
+        shell: pwsh
+        working-directory: bindings/python
+        run: |
+          python -m build --wheel
+
+      - name: Upload wheel (Windows)
+        uses: actions/upload-artifact@v4
+        with:
+          name: pysmu-wheel-windows
+          path: bindings/python/dist/*.whl
+          retention-days: 7
+
