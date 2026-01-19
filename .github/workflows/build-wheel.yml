@@ -8,6 +8,11 @@ jobs:
   build-wheel:
     runs-on: ubuntu-latest
 
+    env:
+      # pkg-config に /usr/local を見せる（libsmu を見つけやすくする）
+      PKG_CONFIG_PATH: /usr/local/lib/pkgconfig:/usr/lib/pkgconfig
+      LD_LIBRARY_PATH: /usr/local/lib:/usr/lib
+
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
@@ -22,29 +27,42 @@ jobs:
             pkg-config \
             libusb-1.0-0-dev \
             libboost-all-dev \
+            libffi-dev \
             python3-dev \
             python3-pip
           python3 -m pip install --upgrade pip
 
-      - name: Set up Python
+      - name: Set up Python 3.14
+        id: setup_py
         uses: actions/setup-python@v5
         with:
           python-version: '3.14'
 
-      - name: Build libsmu
+      - name: Prep Python packages for CMake (build/setuptools/wheel)
+        run: |
+          python -V
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade build setuptools wheel cffi
+
+      - name: Build libsmu (use the same Python found above)
         run: |
           mkdir -p build
           cd build
-          cmake -G "Ninja" ..
+          cmake -G "Ninja" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr/local \
+            -DPython3_EXECUTABLE="$(which python)" \
+            ..
           ninja -v
           sudo ninja install
           sudo ldconfig
 
       - name: Build pysmu wheel
+        working-directory: bindings/python
         run: |
-          cd bindings/python
-          python3 -m pip install --upgrade build setuptools wheel
-          python3 -m build --wheel
+          # 念のため libsmu の検出状況を確認（失敗しても続行）
+          pkg-config --cflags --libs libsmu || true
+          python -m build --wheel
 
       - name: Upload wheel
         uses: actions/upload-artifact@v4
