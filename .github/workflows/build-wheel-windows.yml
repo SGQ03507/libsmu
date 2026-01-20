@@ -8,6 +8,11 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 120
 
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: [ '3.12', '3.14' ]   # 3.14 は未提供のことがあるため matrix 化
+
     env:
       CMAKE_BUILD_TYPE: Release
       INSTALL_PREFIX: C:/install/libsmu
@@ -17,10 +22,19 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.14
+      - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
-          python-version: '3.14'
+          python-version: ${{ matrix.python-version }}
+          allow-prereleases: true           # 3.14 が pre-release でも拾えるように
+          check-latest: true
+
+      - name: Show Python info
+        shell: pwsh
+        run: |
+          python -V
+          where python
+          python -c "import sys,site;print(sys.executable);print(site.getsitepackages())"
 
       - name: Install vcpkg
         shell: pwsh
@@ -82,12 +96,13 @@ jobs:
             Write-Warning "Patch pattern not found. Proceeding without patch (may fail later with C3536)."
           }
 
-      - name: Configure & build libsmu with MSVC
+      # CMake Configure（ここで失敗しても後工程の可視化のためにビルド/ホイールは always 実行）
+      - name: CMake configure (MSVC)
         shell: pwsh
         run: |
           $tripletRoot = "$env:USERPROFILE/vcpkg/installed/$env:VCPKG_TRIPLET"
-          $libusbInc = "$tripletRoot/include/libusb-1.0"
-          $libusbLib = "$tripletRoot/lib/libusb-1.0.lib"
+          $libusbInc   = "$tripletRoot/include/libusb-1.0"
+          $libusbLib   = "$tripletRoot/lib/libusb-1.0.lib"
 
           Write-Host "LIBUSB_INCLUDE_DIRS=$libusbInc"
           Write-Host "LIBUSB_LIBRARIES=$libusbLib"
@@ -109,9 +124,17 @@ jobs:
             -DCMAKE_CXX_STANDARD=17 `
             -DCMAKE_CXX_STANDARD_REQUIRED=ON
 
-          cmake --build . --config Release -- /m
+      - name: CMake build (MSVC)
+        shell: pwsh
+        run: |
+          if (-not (Test-Path build)) {
+            Write-Error "build/ does not exist. CMake configure failed earlier."
+            exit 1
+          }
+          cmake --build build --config Release -- /m
 
       - name: Put libsmu DLL next to pysmu package
+        if: always()                     # 常に表示・実行（中でチェックして落とす）
         shell: pwsh
         run: |
           # Visual Studio の出力場所（例：build/src/Release/…）などを再帰探索
@@ -124,13 +147,17 @@ jobs:
             elseif (Test-Path $cand2) { $dll = Get-Item $cand2 }
           }
 
-          if (-not $dll) { Write-Error "smu DLL not found under build/ tree" }
+          if (-not $dll) {
+            Write-Error "smu DLL not found under build/ tree"
+            exit 1
+          }
 
           New-Item -ItemType Directory -Force -Path bindings/python/pysmu | Out-Null
           Copy-Item $dll.FullName bindings/python/pysmu/libsmu.dll -Force
           Write-Host "Copied $($dll.FullName) -> bindings/python/pysmu/libsmu.dll"
 
       - name: Clean Python binding folder
+        if: always()
         shell: pwsh
         working-directory: bindings/python
         run: |
@@ -139,15 +166,17 @@ jobs:
           if (Test-Path pysmu.egg-info) { Remove-Item -Recurse -Force pysmu.egg-info }
 
       - name: Build pysmu wheel (Windows)
+        if: always()                     # ★ ここを常に出す（前で失敗しても step が表示される）
         shell: pwsh
         working-directory: bindings/python
         run: |
           python -m build --wheel
 
       - name: Upload wheel (Windows)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pysmu-wheel-windows
+          name: pysmu-wheel-windows-py${{ matrix.python-version }}
           path: bindings/python/dist/*.whl
           retention-days: 7
 
@@ -156,7 +185,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-logs-${{ github.run_id }}
+          name: build-logs-${{ github.run_id }}-py${{ matrix.python-version }}
           path: |
             build/**/CMakeOutput.log
             build/**/CMakeError.log
