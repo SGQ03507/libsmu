@@ -1,24 +1,17 @@
 name: Build pysmu wheel (Windows)
 
 on:
-  # 手動実行（Actions画面の「Run workflow」）
   workflow_dispatch:
-
-  # すべてのブランチへの push で実行（必要に応じて絞り込んでOK）
   push:
-    branches:
-      - '**'
+    branches: ['**']
     paths:
       - '.github/workflows/build-wheel-windows.yml'
       - 'src/**'
       - 'bindings/python/**'
       - 'CMakeLists.txt'
       - 'cmake/**'
-
-  # PR でも実行（CI としても使える）
   pull_request:
-    branches:
-      - '**'
+    branches: ['**']
     paths:
       - '.github/workflows/build-wheel-windows.yml'
       - 'src/**'
@@ -31,11 +24,10 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 120
 
-    # Python 3.12/3.14 を試す（3.14 が無い環境でも 3.12 は走る）
     strategy:
       fail-fast: false
       matrix:
-        python-version: [ '3.12', '3.14' ]
+        python-version: ['3.12', '3.14']
 
     env:
       CMAKE_BUILD_TYPE: Release
@@ -79,17 +71,76 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install --upgrade build setuptools wheel cffi
 
-      # ---- ここから：MSVC C3536 回避パッチ（失敗しても続行）----
       - name: Patch session.cpp for MSVC C3536 workaround
         continue-on-error: true
         shell: pwsh
         run: |
+          $f = "src/session.cpp"
+          if (-not (Test-Path $f)) {
+            Write-Error "File not found: $f"
+            exit 1
+          }
+          $src = Get-Content $f -Raw
+          $startIdx = $src.IndexOf("int Session::end ()")
+          if ($startIdx -ge 0) {
+            $snippet = $src.Substring($startIdx, [Math]::Min(1200, $src.Length - $startIdx))
+            Write-Host "----- Session::end() head snippet -----"
+            Write-Host $snippet
+            Write-Host "----- (end of snippet) -----"
+          } else {
+            Write-Warning "Cannot find 'int Session::end ()' in session.cpp"
+          }
+          $pattern = '(?s)auto\s+res\s*=\s*m_completion\.wait_until\s*\(\s*lk\s*,\s*now\s*\+\s*std::chrono::seconds\s*\(\s*waitTime\s*\)\s*,\s*\[\s*&\s*\]\s*\{\s*return\s+m_active_devices\s*==\s*0\s*;\s*\}\s*\)\s*;\s*if\s*\(\s*!\s*res\s*\)\s*\{'
+          $replacement = @"
+  // MSVC C3536 workaround: separate predicate and return value
+  auto pred = [&] { return m_active_devices == 0; };
+  bool done = m_completion.wait_until(lk, now + std::chrono::seconds(waitTime), pred);
+  if (!done) {
+"@
+          if ($src -match $pattern) {
+            $src2 = [regex]::Replace($src, $pattern, $replacement, 1)
+            Set-Content $f -Value $src2 -Encoding UTF8
+            Write-Host "Patched $f for MSVC C3536 workaround."
+          } else {
+            Write-Warning "Patch pattern not found. Proceeding without patch (may fail later with C3536)."
+          }
 
+      - name: CMake configure (MSVC)
+        shell: pwsh
+        run: |
+          $tripletRoot = "$env:USERPROFILE/vcpkg/installed/$env:VCPKG_TRIPLET"
+          $libusbInc   = "$tripletRoot/include/libusb-1.0"
+          $libusbLib   = "$tripletRoot/lib/libusb-1.0.lib"
 
-      - name: Upload wheel artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: pysmu-wheel-windows
-          path: bindings/python/dist/*.whl
-          retention-days: 7
+          Write-Host "LIBUSB_INCLUDE_DIRS=$libusbInc"
+          Write-Host "LIBUSB_LIBRARIES=$libusbLib"
+
+          if (Test-Path build) { Remove-Item -Recurse -Force build }
+          mkdir build
+          cd build
+
+          cmake .. `
+            -G "Visual Studio 17 2022" `
+            -A x64 `
+            -DCMAKE_BUILD_TYPE=%CMAKE_BUILD_TYPE% `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_CHAIN_FILE" `
+            -DLIBUSB_INCLUDE_DIRS="$libusbInc" `
+            -DLIBUSB_LIBRARIES="$libusbLib" `
+            -DBUILD_TESTS=OFF `
+            -DBUILD_EXAMPLES=OFF `
+            -DBUILD_CLI=OFF `
+            -DCMAKE_CXX_STANDARD=17 `
+            -DCMAKE_CXX_STANDARD_REQUIRED=ON
+
+      - name: CMake build (MSVC)
+        shell: pwsh
+        run: |
+          if (-not (Test-Path build)) {
+            Write-Error "build/ does not exist. CMake configure failed earlier."
+            exit 1
+          }
+          cmake --build build --config Release -- /m
+
+      - name: Put libsmu DLL next to pysmu package
+        shell: pwsh
+        run: |
