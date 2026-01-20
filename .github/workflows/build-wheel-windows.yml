@@ -42,43 +42,36 @@ jobs:
           python -m pip install --upgrade build setuptools wheel cffi
 
       # *** ADD *** ここでソースをパッチして MSVC C3536 を回避
+ 
       - name: Patch session.cpp for MSVC C3536 workaround
         shell: pwsh
         run: |
           $f = "src/session.cpp"
-          if (-not (Test-Path $f)) {
-            Write-Error "File not found: $f"
-          }
+          if (-not (Test-Path $f)) { Write-Error "File not found: $f"; exit 1 }
 
           $src = Get-Content $f -Raw
-
-          # 元の wait_until 1行を検出（改行や空白差異を吸収しやすいように緩めのパターン）
           $pattern = '(?s)auto\s+now\s*=\s*std::chrono::system_clock::now\s*\(\s*\)\s*;\s*uint64_t\s+waitTime;.*?auto\s+res\s*=\s*m_completion\.wait_until\s*\(\s*lk\s*,\s*now\s*\+\s*std::chrono::seconds\s*\(\s*waitTime\s*\)\s*,\s*\[\s*&\s*\]\s*\{\s*return\s+m_active_devices\s*==\s*0\s*;\s*\}\s*\)\s*;\s*if\s*\(\s*!\s*res\s*\)\s*\{'
           $replacement = @"
   auto now = std::chrono::system_clock::now ();
   uint64_t waitTime;
   if (m_sample_rate != 0) {
     waitTime = (m_samples/m_sample_rate + 1) + 1;
-  }
-  else {
+  } else {
     waitTime = 0;
   }
-
-  // MSVC C3536 対策：述語と戻り値を分離
   auto pred = [&] { return m_active_devices == 0; };
   bool done = m_completion.wait_until(lk, now + std::chrono::seconds(waitTime), pred);
   if (!done) {
 "@
 
           if ($src -match $pattern) {
-            $src2 = [System.Text.RegularExpressions.Regex]::Replace($src, $pattern, $replacement)
+            $src2 = [regex]::Replace($src, $pattern, $replacement)
             Set-Content $f -Value $src2 -Encoding UTF8
             Write-Host "Patched $f for MSVC C3536 workaround."
+          } else {
+            Write-Warning "Patch pattern not found. Continue build without patch (may fail with C3536)."
+            # ここでは exit しない：Build pysmu wheel まで進めるため
           }
-          else {
-            Write-Warning "Pattern not found. Showing a hint then failing build."
-            Write-Host "Make sure the target block in Session::end() still matches upstream."
-            exit 1
 
       - name: Configure & build libsmu with MSVC
         shell: pwsh
