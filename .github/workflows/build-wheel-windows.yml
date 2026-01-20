@@ -41,36 +41,45 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install --upgrade build setuptools wheel cffi
 
-      # *** ADD *** ここでソースをパッチして MSVC C3536 を回避
- 
+      # ソースをパッチして MSVC C3536 を回避（失敗しても続行）
       - name: Patch session.cpp for MSVC C3536 workaround
+        continue-on-error: true
         shell: pwsh
         run: |
           $f = "src/session.cpp"
-          if (-not (Test-Path $f)) { Write-Error "File not found: $f"; exit 1 }
+          if (-not (Test-Path $f)) {
+            Write-Error "File not found: $f"
+            exit 1
+          }
 
           $src = Get-Content $f -Raw
-          $pattern = '(?s)auto\s+now\s*=\s*std::chrono::system_clock::now\s*\(\s*\)\s*;\s*uint64_t\s+waitTime;.*?auto\s+res\s*=\s*m_completion\.wait_until\s*\(\s*lk\s*,\s*now\s*\+\s*std::chrono::seconds\s*\(\s*waitTime\s*\)\s*,\s*\[\s*&\s*\]\s*\{\s*return\s+m_active_devices\s*==\s*0\s*;\s*\}\s*\)\s*;\s*if\s*\(\s*!\s*res\s*\)\s*\{'
+
+          # デバッグ: end() 先頭のスニペットをダンプ（失敗時の調査用）
+          $startIdx = $src.IndexOf("int Session::end ()")
+          if ($startIdx -ge 0) {
+            $snippet = $src.Substring($startIdx, [Math]::Min(1200, $src.Length - $startIdx))
+            Write-Host "----- Session::end() head snippet -----"
+            Write-Host $snippet
+            Write-Host "----- (end of snippet) -----"
+          } else {
+            Write-Warning "Cannot find 'int Session::end ()' in session.cpp"
+          }
+
+          # wait_until の戻り値を res で受けて if(!res) へ直行するパターンを検出し、述語と戻り値を分離
+          $pattern = '(?s)auto\s+res\s*=\s*m_completion\.wait_until\s*\(\s*lk\s*,\s*now\s*\+\s*std::chrono::seconds\s*\(\s*waitTime\s*\)\s*,\s*\[\s*&\s*\]\s*\{\s*return\s+m_active_devices\s*==\s*0\s*;\s*\}\s*\)\s*;\s*if\s*\(\s*!\s*res\s*\)\s*\{'
           $replacement = @"
-  auto now = std::chrono::system_clock::now ();
-  uint64_t waitTime;
-  if (m_sample_rate != 0) {
-    waitTime = (m_samples/m_sample_rate + 1) + 1;
-  } else {
-    waitTime = 0;
-  }
+  // MSVC C3536 workaround: separate predicate and return value
   auto pred = [&] { return m_active_devices == 0; };
   bool done = m_completion.wait_until(lk, now + std::chrono::seconds(waitTime), pred);
   if (!done) {
 "@
 
           if ($src -match $pattern) {
-            $src2 = [regex]::Replace($src, $pattern, $replacement)
+            $src2 = [regex]::Replace($src, $pattern, $replacement, 1)
             Set-Content $f -Value $src2 -Encoding UTF8
             Write-Host "Patched $f for MSVC C3536 workaround."
           } else {
-            Write-Warning "Patch pattern not found. Continue build without patch (may fail with C3536)."
-            # ここでは exit しない：Build pysmu wheel まで進めるため
+            Write-Warning "Patch pattern not found. Proceeding without patch (may fail later with C3536)."
           }
 
       - name: Configure & build libsmu with MSVC
@@ -97,8 +106,8 @@ jobs:
             -DBUILD_TESTS=OFF `
             -DBUILD_EXAMPLES=OFF `
             -DBUILD_CLI=OFF `
-            -DCMAKE_CXX_STANDARD=17 `                             # *** ADD ***
-            -DCMAKE_CXX_STANDARD_REQUIRED=ON                      # *** ADD ***
+            -DCMAKE_CXX_STANDARD=17 `
+            -DCMAKE_CXX_STANDARD_REQUIRED=ON
 
           cmake --build . --config Release -- /m
 
@@ -140,4 +149,19 @@ jobs:
         with:
           name: pysmu-wheel-windows
           path: bindings/python/dist/*.whl
+          retention-days: 7
+
+      # 失敗時の原因特定用にログ/設定/ソースを常に artifacts へ
+      - name: Upload build logs and sources (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ github.run_id }}
+          path: |
+            build/**/CMakeOutput.log
+            build/**/CMakeError.log
+            build/CMakeCache.txt
+            build/**/*.log
+            src/session.cpp
+            **/*.yml
           retention-days: 7
