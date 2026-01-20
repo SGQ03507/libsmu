@@ -41,6 +41,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install --upgrade build setuptools wheel cffi
 
+
       - name: Configure & build libsmu with MSVC
         shell: pwsh
         run: |
@@ -59,7 +60,6 @@ jobs:
             -G "Visual Studio 17 2022" `
             -A x64 `
             -DCMAKE_BUILD_TYPE=%CMAKE_BUILD_TYPE% `
-            -DCMAKE_INSTALL_PREFIX="${env:INSTALL_PREFIX}" `
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_CHAIN_FILE" `
             -DLIBUSB_INCLUDE_DIRS="$libusbInc" `
             -DLIBUSB_LIBRARIES="$libusbLib" `
@@ -68,19 +68,26 @@ jobs:
             -DBUILD_CLI=OFF
 
           cmake --build . --config Release -- /m
-          cmake --install . --config Release
 
-      - name: Put libsmu.dll next to pysmu package
+
+      - name: Put libsmu DLL next to pysmu package
         shell: pwsh
         run: |
-          $bindir = "${env:INSTALL_PREFIX}\bin"
-          $dll = Get-ChildItem -Path $bindir -Filter "*smu*.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
+          # Visual Studio の出力場所（例：build/src/Release/…）などを再帰探索
+          $dll = Get-ChildItem -Recurse -Path ".\build" -Filter "*smu*.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $dll) {
-            Write-Host "DLL not in install prefix, trying build output..."
-            $dll = Get-ChildItem -Recurse -Path ".\build" -Filter "*smu*.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
+            Write-Host "Try common locations…"
+            $cand1 = ".\build\src\Release\smu.dll"
+            $cand2 = ".\build\Release\smu.dll"
+            if (Test-Path $cand1) { $dll = Get-Item $cand1 }
+            elseif (Test-Path $cand2) { $dll = Get-Item $cand2 }
           }
-          if (-not $dll) { Write-Error "smu DLL not found" }
+
+          if (-not $dll) { Write-Error "smu DLL not found under build/ tree" }
+
+          New-Item -ItemType Directory -Force -Path bindings/python/pysmu | Out-Null
           Copy-Item $dll.FullName bindings/python/pysmu/libsmu.dll -Force
+          Write-Host "Copied $($dll.FullName) -> bindings/python/pysmu/libsmu.dll"
 
       - name: Clean Python binding folder
         shell: pwsh
