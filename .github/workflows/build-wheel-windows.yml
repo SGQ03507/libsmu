@@ -1,17 +1,41 @@
 name: Build pysmu wheel (Windows)
 
 on:
+  # 手動実行（Actions画面の「Run workflow」）
   workflow_dispatch:
+
+  # すべてのブランチへの push で実行（必要に応じて絞り込んでOK）
+  push:
+    branches:
+      - '**'
+    paths:
+      - '.github/workflows/build-wheel-windows.yml'
+      - 'src/**'
+      - 'bindings/python/**'
+      - 'CMakeLists.txt'
+      - 'cmake/**'
+
+  # PR でも実行（CI としても使える）
+  pull_request:
+    branches:
+      - '**'
+    paths:
+      - '.github/workflows/build-wheel-windows.yml'
+      - 'src/**'
+      - 'bindings/python/**'
+      - 'CMakeLists.txt'
+      - 'cmake/**'
 
 jobs:
   build-wheel-windows:
     runs-on: windows-latest
     timeout-minutes: 120
 
+    # Python 3.12/3.14 を試す（3.14 が無い環境でも 3.12 は走る）
     strategy:
       fail-fast: false
       matrix:
-        python-version: [ '3.12', '3.14' ]   # 3.14 は未提供のことがあるため matrix 化
+        python-version: [ '3.12', '3.14' ]
 
     env:
       CMAKE_BUILD_TYPE: Release
@@ -26,7 +50,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-          allow-prereleases: true           # 3.14 が pre-release でも拾えるように
+          allow-prereleases: true
           check-latest: true
 
       - name: Show Python info
@@ -55,142 +79,8 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install --upgrade build setuptools wheel cffi
 
-      # ソースをパッチして MSVC C3536 を回避（失敗しても続行）
+      # ---- ここから：MSVC C3536 回避パッチ（失敗しても続行）----
       - name: Patch session.cpp for MSVC C3536 workaround
         continue-on-error: true
         shell: pwsh
         run: |
-          $f = "src/session.cpp"
-          if (-not (Test-Path $f)) {
-            Write-Error "File not found: $f"
-            exit 1
-          }
-
-          $src = Get-Content $f -Raw
-
-          # デバッグ: end() 先頭のスニペットをダンプ（失敗時の調査用）
-          $startIdx = $src.IndexOf("int Session::end ()")
-          if ($startIdx -ge 0) {
-            $snippet = $src.Substring($startIdx, [Math]::Min(1200, $src.Length - $startIdx))
-            Write-Host "----- Session::end() head snippet -----"
-            Write-Host $snippet
-            Write-Host "----- (end of snippet) -----"
-          } else {
-            Write-Warning "Cannot find 'int Session::end ()' in session.cpp"
-          }
-
-          # wait_until の戻り値を res で受けて if(!res) へ直行するパターンを検出し、述語と戻り値を分離
-          $pattern = '(?s)auto\s+res\s*=\s*m_completion\.wait_until\s*\(\s*lk\s*,\s*now\s*\+\s*std::chrono::seconds\s*\(\s*waitTime\s*\)\s*,\s*\[\s*&\s*\]\s*\{\s*return\s+m_active_devices\s*==\s*0\s*;\s*\}\s*\)\s*;\s*if\s*\(\s*!\s*res\s*\)\s*\{'
-          $replacement = @"
-  // MSVC C3536 workaround: separate predicate and return value
-  auto pred = [&] { return m_active_devices == 0; };
-  bool done = m_completion.wait_until(lk, now + std::chrono::seconds(waitTime), pred);
-  if (!done) {
-"@
-
-          if ($src -match $pattern) {
-            $src2 = [regex]::Replace($src, $pattern, $replacement, 1)
-            Set-Content $f -Value $src2 -Encoding UTF8
-            Write-Host "Patched $f for MSVC C3536 workaround."
-          } else {
-            Write-Warning "Patch pattern not found. Proceeding without patch (may fail later with C3536)."
-          }
-
-      # CMake Configure（ここで失敗しても後工程の可視化のためにビルド/ホイールは always 実行）
-      - name: CMake configure (MSVC)
-        shell: pwsh
-        run: |
-          $tripletRoot = "$env:USERPROFILE/vcpkg/installed/$env:VCPKG_TRIPLET"
-          $libusbInc   = "$tripletRoot/include/libusb-1.0"
-          $libusbLib   = "$tripletRoot/lib/libusb-1.0.lib"
-
-          Write-Host "LIBUSB_INCLUDE_DIRS=$libusbInc"
-          Write-Host "LIBUSB_LIBRARIES=$libusbLib"
-
-          if (Test-Path build) { Remove-Item -Recurse -Force build }
-          mkdir build
-          cd build
-
-          cmake .. `
-            -G "Visual Studio 17 2022" `
-            -A x64 `
-            -DCMAKE_BUILD_TYPE=%CMAKE_BUILD_TYPE% `
-            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_CHAIN_FILE" `
-            -DLIBUSB_INCLUDE_DIRS="$libusbInc" `
-            -DLIBUSB_LIBRARIES="$libusbLib" `
-            -DBUILD_TESTS=OFF `
-            -DBUILD_EXAMPLES=OFF `
-            -DBUILD_CLI=OFF `
-            -DCMAKE_CXX_STANDARD=17 `
-            -DCMAKE_CXX_STANDARD_REQUIRED=ON
-
-      - name: CMake build (MSVC)
-        shell: pwsh
-        run: |
-          if (-not (Test-Path build)) {
-            Write-Error "build/ does not exist. CMake configure failed earlier."
-            exit 1
-          }
-          cmake --build build --config Release -- /m
-
-      - name: Put libsmu DLL next to pysmu package
-        if: always()                     # 常に表示・実行（中でチェックして落とす）
-        shell: pwsh
-        run: |
-          # Visual Studio の出力場所（例：build/src/Release/…）などを再帰探索
-          $dll = Get-ChildItem -Recurse -Path ".\build" -Filter "*smu*.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $dll) {
-            Write-Host "Try common locations…"
-            $cand1 = ".\build\src\Release\smu.dll"
-            $cand2 = ".\build\Release\smu.dll"
-            if (Test-Path $cand1) { $dll = Get-Item $cand1 }
-            elseif (Test-Path $cand2) { $dll = Get-Item $cand2 }
-          }
-
-          if (-not $dll) {
-            Write-Error "smu DLL not found under build/ tree"
-            exit 1
-          }
-
-          New-Item -ItemType Directory -Force -Path bindings/python/pysmu | Out-Null
-          Copy-Item $dll.FullName bindings/python/pysmu/libsmu.dll -Force
-          Write-Host "Copied $($dll.FullName) -> bindings/python/pysmu/libsmu.dll"
-
-      - name: Clean Python binding folder
-        if: always()
-        shell: pwsh
-        working-directory: bindings/python
-        run: |
-          if (Test-Path build) { Remove-Item -Recurse -Force build }
-          if (Test-Path dist) { Remove-Item -Recurse -Force dist }
-          if (Test-Path pysmu.egg-info) { Remove-Item -Recurse -Force pysmu.egg-info }
-
-      - name: Build pysmu wheel (Windows)
-        if: always()                     # ★ ここを常に出す（前で失敗しても step が表示される）
-        shell: pwsh
-        working-directory: bindings/python
-        run: |
-          python -m build --wheel
-
-      - name: Upload wheel (Windows)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: pysmu-wheel-windows-py${{ matrix.python-version }}
-          path: bindings/python/dist/*.whl
-          retention-days: 7
-
-      # 失敗時の原因特定用にログ/設定/ソースを常に artifacts へ
-      - name: Upload build logs and sources (always)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-logs-${{ github.run_id }}-py${{ matrix.python-version }}
-          path: |
-            build/**/CMakeOutput.log
-            build/**/CMakeError.log
-            build/CMakeCache.txt
-            build/**/*.log
-            src/session.cpp
-            **/*.yml
-          retention-days: 7
