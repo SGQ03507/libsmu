@@ -84,3 +84,12 @@ jobs:
         continue-on-error: true
         shell: pwsh
         run: |
+
+
+      - name: Upload wheel artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pysmu-wheel-windows
+          path: bindings/python/dist/*.whl
+          retention-days: 7
